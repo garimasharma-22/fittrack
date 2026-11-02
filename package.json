@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "multer": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0"
+  },
+  "scripts:create-admin": "tsx scripts/createAdmin.ts"
+}

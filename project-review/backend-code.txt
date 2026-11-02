@@ -1,0 +1,5635 @@
+﻿
+================ FILE: package.json ================
+
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.11.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.11.1",
+    "swagger-jsdoc": "^6.3.0",
+    "swagger-ui-express": "^5.0.1",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^26.6.5",
+    "@types/swagger-jsdoc": "^6.0.4",
+    "@types/swagger-ui-express": "^4.1.8",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
+
+
+================ FILE: src\app.ts ================
+
+
+import express from "express";
+import cors from "cors";
+import cookieParser from "cookie-parser";
+import swaggerUi from "swagger-ui-express";
+
+import swaggerSpec from "./config/swagger";
+
+import { handleUploadError } from "./middleware/uploadMiddleware";
+import { errorMiddleware } from "./middleware/errorMiddleware";
+
+import authRoutes from "./routes/authRoutes";
+import userRoutes from "./routes/userRoutes";
+import membershipPlanRoutes from "./routes/membershipPlanRoutes";
+import membershipRoutes from "./routes/membershipRoutes";
+import paymentRoutes from "./routes/paymentRoutes";
+import workoutPlanRoutes from "./routes/workoutPlanRoutes";
+import workoutAssignmentRoutes from "./routes/workoutAssignmentRoutes";
+
+
+const app = express();
+
+// 1. CORS configuration
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    credentials: true,
+  })
+);
+
+// 2. Request body parsing
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+
+// 3. Health check
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "FitTrack API is running",
+  });
+});
+
+// 4. API routes
+app.use("/api/auth", authRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/membership-plans", membershipPlanRoutes);
+app.use("/api/memberships", membershipRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/workout-plans", workoutPlanRoutes);
+app.use("/api/workout-assignments", workoutAssignmentRoutes);
+
+
+// 5. Swagger documentation
+app.use(
+  "/api-docs",
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerSpec)
+);
+
+// 6. Handle Multer upload errors
+app.use(handleUploadError);
+
+// 7. Handle other application errors
+app.use(errorMiddleware);
+
+export default app;
+
+
+================ FILE: src\config\cloudinary.ts ================
+
+import path from "path";
+import dotenv from "dotenv";
+import { v2 as cloudinary } from "cloudinary";
+
+dotenv.config({
+  path: path.resolve(process.cwd(), ".env"),
+});
+
+console.log("Cloudinary configuration check:", {
+  cloudNameLoaded: Boolean(process.env.CLOUDINARY_CLOUD_NAME),
+  apiKeyLoaded: Boolean(process.env.CLOUDINARY_API_KEY),
+  apiSecretLoaded: Boolean(process.env.CLOUDINARY_API_SECRET),
+});
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+export default cloudinary;
+
+================ FILE: src\config\database.ts ================
+
+
+import mongoose from "mongoose";
+
+export const connectDatabase = async (): Promise<void> => {
+  const mongoUri = process.env.MONGODB_URI;
+
+  if (!mongoUri) {
+    throw new Error("MONGODB_URI is missing from the environment");
+  }
+
+  await mongoose.connect(mongoUri);
+
+  console.log("MongoDB connected successfully");
+};
+
+
+================ FILE: src\config\swagger.ts ================
+
+import swaggerJsdoc from "swagger-jsdoc";
+
+const options: swaggerJsdoc.Options = {
+  failOnErrors: true,
+  definition: {
+    openapi: "3.0.3",
+    info: {
+      title: "FitTrack API",
+      version: "1.0.0",
+      description:
+        "API documentation for the FitTrack gym management system",
+    },
+    servers: [
+      {
+        url: "http://localhost:5000",
+        description: "Local development server",
+      },
+    ],
+    components: {
+      securitySchemes: {
+        cookieAuth: {
+          type: "apiKey",
+          in: "cookie",
+          name: "fittrack_token",
+        },
+      },
+    },
+  },
+  apis: ["./src/routes/*.ts"],
+};
+
+const swaggerSpec = swaggerJsdoc(options);
+
+export default swaggerSpec;
+
+================ FILE: src\controllers\authController.ts ================
+
+
+import { Request, Response, NextFunction } from "express";
+import bcrypt from "bcrypt";
+import cloudinary from "../config/cloudinary";
+
+import User from "../models/User";
+import { registerSchema, loginSchema } from "../validators/authValidator";
+import { createToken } from "../utils/jwt";
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax" as const,
+  path: "/",
+  maxAge: 24 * 60 * 60 * 1000,
+};
+
+const uploadImage = (
+  buffer: Buffer
+): Promise<{ url: string; publicId: string }> =>
+  new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "fittrack/profile-images",
+        resource_type: "image",
+      },
+      (error, result) => {
+        if (error || !result) {
+          reject(error ?? new Error("Image upload failed"));
+          return;
+        }
+
+        resolve({
+          url: result.secure_url,
+          publicId: result.public_id,
+        });
+      }
+    );
+
+    stream.end(buffer);
+  });
+
+const removeImage = async (publicId?: string): Promise<void> => {
+  if (!publicId) return;
+
+  try {
+    await cloudinary.uploader.destroy(publicId);
+  } catch (error) {
+    console.error("Cloudinary cleanup failed:", error);
+  }
+};
+
+const safeUser = (user: {
+  _id: unknown;
+  name: string;
+  email: string;
+  phone?: string;
+  role: string;
+  profileImage?: { url: string; publicId: string };
+}) => ({
+  id: String(user._id),
+  name: user.name,
+  email: user.email,
+  phone: user.phone ?? null,
+  role: user.role,
+  profileImage: user.profileImage?.url ?? null,
+});
+
+// Register a new member.
+export const register = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  let uploadedPublicId: string | undefined;
+
+  try {
+    const parsed = registerSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid registration details.",
+        errors: parsed.error.issues,
+      });
+      return;
+    }
+
+    if (!req.file) {
+      res.status(400).json({
+        success: false,
+        message: "Profile picture is required.",
+      });
+      return;
+    }
+
+    const { name, phone, email, password } = parsed.data;
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+      return;
+    }
+
+    const profileImage = await uploadImage(req.file.buffer);
+    uploadedPublicId = profileImage.publicId;
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    // Public registration must never assign an administrator role.
+    const user = await User.create({
+      name,
+      email,
+      phone,
+      passwordHash,
+      role: "MEMBER",
+      profileImage,
+    });
+
+    const token = createToken({
+      userId: String(user._id),
+      role: user.role,
+    });
+
+    res.cookie("fittrack_token", token, cookieOptions);
+
+    res.status(201).json({
+      success: true,
+      message: "Registration successful.",
+      user: safeUser(user),
+    });
+  } catch (error) {
+    // Clean up the uploaded image if registration fails.
+    await removeImage(uploadedPublicId);
+
+    // Handle duplicate email errors, including concurrent registrations.
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === 11000
+    ) {
+      res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+      return;
+    }
+
+    next(error);
+  }
+};
+
+// Log in an existing user.
+export const login = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const parsed = loginSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid login details.",
+      });
+      return;
+    }
+
+    const user = await User.findOne({
+      email: parsed.data.email,
+    }).select("+passwordHash");
+
+    if (!user) {
+      res.status(401).json({
+        success: false,
+        message: "Invalid email or password.",
+      });
+      return;
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      parsed.data.password,
+      user.passwordHash
+    );
+
+    if (!passwordMatches || !user.isActive) {
+      res.status(401).json({
+        success: false,
+        message: "Invalid email or password.",
+      });
+      return;
+    }
+
+    const token = createToken({
+      userId: String(user._id),
+      role: user.role,
+    });
+
+    res.cookie("fittrack_token", token, cookieOptions);
+
+    res.status(200).json({
+      success: true,
+      message: "Login successful.",
+      user: safeUser(user),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Log out the authenticated user.
+export const logout = (_req: Request, res: Response): void => {
+  res.clearCookie("fittrack_token", {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+  });
+
+  res.status(200).json({
+    success: true,
+    message: "Logged out successfully.",
+  });
+};
+
+// Get the currently authenticated user.
+export const getMe = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const user = await User.findById(req.user?.userId);
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+      return;
+    }
+
+    if (!user.isActive) {
+      res.status(401).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      user: safeUser(user),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Update the authenticated user's profile picture.
+export const updateProfileImage = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  let uploadedPublicId: string | undefined;
+
+  try {
+    if (!req.file) {
+      res.status(400).json({
+        success: false,
+        message: "Profile picture is required.",
+      });
+      return;
+    }
+
+    const user = await User.findById(req.user?.userId);
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+      return;
+    }
+
+    if (!user.isActive) {
+      res.status(401).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+      return;
+    }
+
+    const newImage = await uploadImage(req.file.buffer);
+    uploadedPublicId = newImage.publicId;
+
+    const oldPublicId = user.profileImage?.publicId;
+
+    user.profileImage = newImage;
+    await user.save();
+
+    // The database now references the new image.
+    uploadedPublicId = undefined;
+
+    // Delete the old image only after the save succeeds.
+    if (oldPublicId && oldPublicId !== newImage.publicId) {
+      await removeImage(oldPublicId);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Profile picture updated successfully.",
+      user: safeUser(user),
+    });
+  } catch (error) {
+    await removeImage(uploadedPublicId);
+    next(error);
+  }
+};
+
+================ FILE: src\controllers\membershipController.ts ================
+
+
+import { Request, Response, NextFunction } from "express";
+import mongoose from "mongoose";
+
+import Membership from "../models/Membership";
+import MembershipPlan from "../models/MembershipPlan";
+import User from "../models/User";
+
+import {
+  createMembershipSchema,
+  cancelMembershipSchema,
+  renewMembershipSchema,
+} from "../validators/membershipValidator";
+
+// Calculate the correct status using membership dates.
+const getCurrentStatus = (
+  startDate: Date,
+  expiryDate: Date
+): "UPCOMING" | "ACTIVE" | "EXPIRED" => {
+  const now = new Date();
+
+  if (expiryDate <= now) {
+    return "EXPIRED";
+  }
+
+  if (startDate > now) {
+    return "UPCOMING";
+  }
+
+  return "ACTIVE";
+};
+
+// Refresh date-based membership statuses in the database.
+const refreshMembershipStatuses = async (): Promise<void> => {
+  const now = new Date();
+
+  await Membership.updateMany(
+    {
+      status: { $in: ["ACTIVE", "UPCOMING"] },
+      expiryDate: { $lte: now },
+    },
+    { $set: { status: "EXPIRED" } }
+  );
+
+  await Membership.updateMany(
+    {
+      status: "UPCOMING",
+      startDate: { $lte: now },
+      expiryDate: { $gt: now },
+    },
+    { $set: { status: "ACTIVE" } }
+  );
+};
+
+// POST /api/memberships
+// Admin assigns a membership plan to a member.
+export const createMembership = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const validation = createMembershipSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const { memberId, planId, startDate } = validation.data;
+
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    // Only an active MEMBER account can receive a membership.
+    const member = await User.findOne({
+      _id: memberId,
+      role: "MEMBER",
+      isActive: true,
+    });
+
+    if (!member) {
+      res.status(404).json({
+        success: false,
+        message: "Active member not found",
+      });
+      return;
+    }
+
+    // The selected membership plan must be active.
+    const plan = await MembershipPlan.findOne({
+      _id: planId,
+      isActive: true,
+    });
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Active membership plan not found",
+      });
+      return;
+    }
+
+    const membershipStartDate = startDate
+      ? new Date(startDate)
+      : new Date();
+
+    if (Number.isNaN(membershipStartDate.getTime())) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership start date",
+      });
+      return;
+    }
+
+    const expiryDate = new Date(membershipStartDate);
+
+    expiryDate.setDate(
+      expiryDate.getDate() + plan.durationDays
+    );
+
+    if (
+      Number.isNaN(expiryDate.getTime()) ||
+      expiryDate <= membershipStartDate
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership dates",
+      });
+      return;
+    }
+
+    // Prevent overlapping active or upcoming memberships.
+    const existingMembership = await Membership.findOne({
+      memberId: member._id,
+      status: { $in: ["ACTIVE", "UPCOMING"] },
+      startDate: { $lt: expiryDate },
+      expiryDate: { $gt: membershipStartDate },
+    });
+
+    if (existingMembership) {
+      res.status(409).json({
+        success: false,
+        message:
+          "This member already has a membership covering the requested period",
+      });
+      return;
+    }
+
+    const membership = await Membership.create({
+      memberId: member._id,
+      planId: plan._id,
+      startDate: membershipStartDate,
+      expiryDate,
+      priceCharged: plan.price,
+      status: getCurrentStatus(
+        membershipStartDate,
+        expiryDate
+      ),
+      assignedBy: new mongoose.Types.ObjectId(
+        currentUser.userId
+      ),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Membership assigned successfully",
+      data: membership,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/memberships/me
+// Member views only their own memberships.
+export const getMyMemberships = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const memberships = await Membership.find({
+      memberId: currentUser.userId,
+    })
+      .populate("planId", "name description durationDays price")
+      .sort({ createdAt: -1 });
+
+    // Refresh statuses without changing cancellations.
+    for (const membership of memberships) {
+      if (membership.status === "CANCELLED") {
+        continue;
+      }
+
+      const currentStatus = getCurrentStatus(
+        membership.startDate,
+        membership.expiryDate
+      );
+
+      if (membership.status !== currentStatus) {
+        membership.status = currentStatus;
+        await membership.save();
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      count: memberships.length,
+      data: memberships,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+/**
+ * GET /api/memberships
+ * Admin views all memberships.
+ */
+export const getAllMemberships = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    await refreshMembershipStatuses();
+
+    const memberships = await Membership.find()
+      .populate("memberId", "name email phone")
+      .populate("planId", "name description durationDays price")
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: memberships.length,
+      data: memberships,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/memberships/expiring
+// Admin views memberships expiring within the next seven days.
+export const getExpiringMemberships = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const now = new Date();
+    const sevenDaysLater = new Date(now);
+
+    sevenDaysLater.setDate(sevenDaysLater.getDate() + 7);
+
+    const memberships = await Membership.find({
+      status: "ACTIVE",
+      startDate: { $lte: now },
+      expiryDate: {
+        $gt: now,
+        $lte: sevenDaysLater,
+      },
+    })
+      .populate("memberId", "name email phone")
+      .populate("planId", "name durationDays price")
+      .sort({ expiryDate: 1 });
+
+    res.status(200).json({
+      success: true,
+      count: memberships.length,
+      data: memberships,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/memberships/:id
+// Admin can view any membership.
+// Member can view only their own membership.
+export const getMembershipById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership ID",
+      });
+      return;
+    }
+
+    const membership = await Membership.findById(id)
+      .populate("memberId", "name email phone")
+      .populate(
+        "planId",
+        "name description durationDays price"
+      );
+
+    if (!membership) {
+      res.status(404).json({
+        success: false,
+        message: "Membership not found",
+      });
+      return;
+    }
+
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const isAdmin = currentUser.role === "ADMIN";
+
+    // Safely obtain the member ID whether the reference
+    // is populated or is still a MongoDB ObjectId.
+    const memberReference = membership.memberId as unknown as {
+      _id?: { toString(): string };
+      toString(): string;
+    };
+
+    const membershipMemberId =
+      memberReference?._id?.toString() ??
+      memberReference?.toString();
+
+    const belongsToMember =
+      membershipMemberId === currentUser.userId;
+
+    if (!isAdmin && !belongsToMember) {
+      res.status(403).json({
+        success: false,
+        message:
+          "You cannot access another member's membership",
+      });
+      return;
+    }
+
+    // Refresh the date-based status, preserving cancellations.
+    if (membership.status !== "CANCELLED") {
+      const currentStatus = getCurrentStatus(
+        membership.startDate,
+        membership.expiryDate
+      );
+
+      if (membership.status !== currentStatus) {
+        membership.status = currentStatus;
+        await membership.save();
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: membership,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PATCH /api/memberships/:id/cancel
+// Admin cancels a membership.
+export const cancelMembership = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership ID",
+      });
+      return;
+    }
+
+    const validation = cancelMembershipSchema.safeParse(
+      req.body ?? {}
+    );
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const membership = await Membership.findById(id);
+
+    if (!membership) {
+      res.status(404).json({
+        success: false,
+        message: "Membership not found",
+      });
+      return;
+    }
+
+    if (membership.status === "CANCELLED") {
+      res.status(409).json({
+        success: false,
+        message: "Membership is already cancelled",
+      });
+      return;
+    }
+
+    const currentStatus = getCurrentStatus(
+      membership.startDate,
+      membership.expiryDate
+    );
+
+    if (currentStatus === "EXPIRED") {
+      res.status(409).json({
+        success: false,
+        message: "Expired memberships cannot be cancelled",
+      });
+      return;
+    }
+
+    membership.status = "CANCELLED";
+
+    await membership.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Membership cancelled successfully",
+      data: {
+        membership,
+        reason: validation.data.reason ?? null,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/memberships/:id/renew
+// Admin renews a membership by creating a new record.
+export const renewMembership = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership ID",
+      });
+      return;
+    }
+
+    const validation = renewMembershipSchema.safeParse(
+      req.body ?? {}
+    );
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const previousMembership = await Membership.findById(id);
+
+    if (!previousMembership) {
+      res.status(404).json({
+        success: false,
+        message: "Membership not found",
+      });
+      return;
+    }
+
+    if (previousMembership.status === "CANCELLED") {
+      res.status(409).json({
+        success: false,
+        message: "A cancelled membership cannot be renewed",
+      });
+      return;
+    }
+
+    const planId =
+      validation.data.planId ??
+      previousMembership.planId.toString();
+
+    const plan = await MembershipPlan.findOne({
+      _id: planId,
+      isActive: true,
+    });
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Active membership plan not found",
+      });
+      return;
+    }
+
+    const now = new Date();
+
+    // Continue after the previous expiry if it is in the future.
+    // Otherwise, start the renewal now.
+    const startDate =
+      previousMembership.expiryDate > now
+        ? new Date(previousMembership.expiryDate)
+        : now;
+
+    const expiryDate = new Date(startDate);
+
+    expiryDate.setDate(
+      expiryDate.getDate() + plan.durationDays
+    );
+
+    // Prevent overlapping active or upcoming memberships.
+    const conflictingMembership = await Membership.findOne({
+      memberId: previousMembership.memberId,
+      status: { $in: ["ACTIVE", "UPCOMING"] },
+      startDate: { $lt: expiryDate },
+      expiryDate: { $gt: startDate },
+    });
+
+    if (conflictingMembership) {
+      res.status(409).json({
+        success: false,
+        message:
+          "Another membership already covers the renewal period",
+      });
+      return;
+    }
+
+    const membership = await Membership.create({
+      memberId: previousMembership.memberId,
+      planId: plan._id,
+      startDate,
+      expiryDate,
+      priceCharged: plan.price,
+      status: getCurrentStatus(startDate, expiryDate),
+      assignedBy: new mongoose.Types.ObjectId(
+        currentUser.userId
+      ),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Membership renewed successfully",
+      data: membership,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+================ FILE: src\controllers\membershipPlanController.ts ================
+
+import { Request, Response, NextFunction } from "express";
+import mongoose from "mongoose";
+import MembershipPlan from "../models/MembershipPlan";
+import {
+  createMembershipPlanSchema,
+  updateMembershipPlanSchema,
+} from "../validators/membershipPlanValidator";
+
+// GET /api/membership-plans
+// List all active membership plans
+export const getMembershipPlans = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const plans = await MembershipPlan.find({ isActive: true })
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: plans.length,
+      data: plans,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/membership-plans/:id
+// Get one active membership plan
+export const getMembershipPlanById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership plan ID",
+      });
+      return;
+    }
+
+    const plan = await MembershipPlan.findOne({
+      _id: id,
+      isActive: true,
+    });
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Membership plan not found",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/membership-plans
+// Create a membership plan (ADMIN only)
+export const createMembershipPlan = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const validation = createMembershipPlanSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const plan = await MembershipPlan.create(validation.data);
+
+    res.status(201).json({
+      success: true,
+      message: "Membership plan created successfully",
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PATCH /api/membership-plans/:id
+// Update a membership plan (ADMIN only)
+export const updateMembershipPlan = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership plan ID",
+      });
+      return;
+    }
+
+    const validation = updateMembershipPlanSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const plan = await MembershipPlan.findOneAndUpdate(
+      { _id: id, isActive: true },
+      validation.data,
+      { new: true, runValidators: true }
+    );
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Active membership plan not found",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Membership plan updated successfully",
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// DELETE /api/membership-plans/:id
+// Deactivate a membership plan instead of permanently deleting it
+export const deactivateMembershipPlan = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership plan ID",
+      });
+      return;
+    }
+
+    const plan = await MembershipPlan.findOneAndUpdate(
+      { _id: id, isActive: true },
+      { isActive: false },
+      { new: true, runValidators: true }
+    );
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Active membership plan not found",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Membership plan deactivated successfully",
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+================ FILE: src\controllers\paymentController.ts ================
+
+import { Request, Response, NextFunction } from "express";
+import mongoose from "mongoose";
+
+import Payment from "../models/Payment";
+import Membership from "../models/Membership";
+import { createPaymentSchema } from "../validators/paymentValidator";
+
+// POST /api/payments
+// Admin records a payment for an existing membership.
+export const createPayment = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can record payments",
+      });
+      return;
+    }
+
+    const validation = createPaymentSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const {
+      membershipId,
+      amount,
+      paymentDate,
+      paymentMethod,
+      reference,
+      notes,
+    } = validation.data;
+
+    if (!mongoose.isValidObjectId(membershipId)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid membership ID",
+      });
+      return;
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      res.status(400).json({
+        success: false,
+        message: "Payment amount must be greater than zero",
+      });
+      return;
+    }
+
+    const membership = await Membership.findById(membershipId);
+
+    if (!membership) {
+      res.status(404).json({
+        success: false,
+        message: "Membership not found",
+      });
+      return;
+    }
+
+    if (membership.status === "CANCELLED") {
+      res.status(409).json({
+        success: false,
+        message: "Cannot record a payment for a cancelled membership",
+      });
+      return;
+    }
+
+    const actualPaymentDate = paymentDate
+      ? new Date(paymentDate)
+      : new Date();
+
+    if (Number.isNaN(actualPaymentDate.getTime())) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid payment date",
+      });
+      return;
+    }
+
+    if (actualPaymentDate > new Date()) {
+      res.status(400).json({
+        success: false,
+        message: "Payment date cannot be in the future",
+      });
+      return;
+    }
+
+    // Calculate how much has already been paid for this membership.
+    const existingPayments = await Payment.aggregate([
+      {
+        $match: {
+          membershipId: membership._id,
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalPaid: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    const totalPaid = existingPayments[0]?.totalPaid ?? 0;
+    const remainingBalance = Math.max(
+      0,
+      membership.priceCharged - totalPaid
+    );
+
+    if (amount > remainingBalance) {
+      res.status(409).json({
+        success: false,
+        message: "Payment exceeds the remaining membership balance",
+        data: {
+          membershipPrice: membership.priceCharged,
+          totalPaid,
+          remainingBalance,
+        },
+      });
+      return;
+    }
+
+    // Derive the member from the membership, never from client input.
+    const payment = await Payment.create({
+      memberId: membership.memberId,
+      membershipId: membership._id,
+      amount,
+      paymentDate: actualPaymentDate,
+      paymentMethod,
+      reference,
+      notes,
+      recordedBy: new mongoose.Types.ObjectId(currentUser.userId),
+    });
+
+    const populatedPayment = await Payment.findById(payment._id)
+      .populate("memberId", "name email phone")
+      .populate(
+        "membershipId",
+        "startDate expiryDate priceCharged status"
+      )
+      .populate("recordedBy", "name email");
+
+    res.status(201).json({
+      success: true,
+      message: "Payment recorded successfully",
+      data: populatedPayment,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/payments
+// Admin views all payments.
+export const getAllPayments = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (req.user.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can view all payments",
+      });
+      return;
+    }
+
+    const payments = await Payment.find()
+      .populate("memberId", "name email phone")
+      .populate(
+        "membershipId",
+        "startDate expiryDate priceCharged status"
+      )
+      .populate("recordedBy", "name email")
+      .sort({ paymentDate: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: payments.length,
+      data: payments,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/payments/me
+// Member views only their own payment history.
+export const getMyPayments = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "MEMBER") {
+      res.status(403).json({
+        success: false,
+        message: "This endpoint is for members",
+      });
+      return;
+    }
+
+    const payments = await Payment.find({
+      memberId: currentUser.userId,
+    })
+      .populate(
+        "membershipId",
+        "startDate expiryDate priceCharged status"
+      )
+      .sort({ paymentDate: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: payments.length,
+      data: payments,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/payments/:id
+// Admin can view any payment; a member can view only their own.
+export const getPaymentById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid payment ID",
+      });
+      return;
+    }
+
+    const payment = await Payment.findById(id)
+      .populate("memberId", "name email phone")
+      .populate(
+        "membershipId",
+        "startDate expiryDate priceCharged status"
+      )
+      .populate("recordedBy", "name email");
+
+    if (!payment) {
+      res.status(404).json({
+        success: false,
+        message: "Payment not found",
+      });
+      return;
+    }
+
+    const isAdmin = currentUser.role === "ADMIN";
+
+    // Handle the populated member reference safely.
+    const memberReference = payment.memberId as unknown as {
+      _id?: { toString(): string };
+      toString(): string;
+    };
+
+    const paymentMemberId =
+      memberReference?._id?.toString() ??
+      memberReference?.toString();
+
+    const isOwner = paymentMemberId === currentUser.userId;
+
+    if (!isAdmin && !isOwner) {
+      res.status(403).json({
+        success: false,
+        message: "You cannot access another member's payment",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: payment,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+================ FILE: src\controllers\userController.ts ================
+
+
+import type { Request, Response, NextFunction } from "express";
+import bcrypt from "bcrypt";
+import mongoose from "mongoose";
+
+import User from "../models/User";
+import {
+  createMemberSchema,
+  updateMemberSchema,
+} from "../validators/userValidator";
+
+// GET /api/users
+// List members with optional name/email search.
+export const getMembers = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const search = String(req.query.search ?? "").trim();
+
+    const filter: Record<string, unknown> = {
+      role: "MEMBER",
+    };
+
+    if (search) {
+      // Escape regex characters so search input is treated literally.
+      const safeSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      filter.$or = [
+        { name: { $regex: safeSearch, $options: "i" } },
+        { email: { $regex: safeSearch, $options: "i" } },
+      ];
+    }
+
+    const members = await User.find(filter)
+      .select("-passwordHash")
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: members.length,
+      data: members,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/users/:id
+// Retrieve one member.
+export const getMemberById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid member ID.",
+      });
+      return;
+    }
+
+    const member = await User.findOne({
+      _id: id,
+      role: "MEMBER",
+    }).select("-passwordHash");
+
+    if (!member) {
+      res.status(404).json({
+        success: false,
+        message: "Member not found.",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: member,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/users
+// Admin creates a member account.
+export const createMember = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const validation = createMemberSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed.",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const { name, email, phone, password } = validation.data;
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+      return;
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const member = await User.create({
+      name,
+      email,
+      phone,
+      passwordHash,
+      role: "MEMBER",
+      isActive: true,
+    });
+
+    const safeMember = await User.findById(member._id)
+      .select("-passwordHash");
+
+    res.status(201).json({
+      success: true,
+      message: "Member created successfully.",
+      data: safeMember,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PATCH /api/users/:id
+// Admin updates member details or active status.
+export const updateMember = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid member ID.",
+      });
+      return;
+    }
+
+    const validation = updateMemberSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed.",
+        errors: validation.error.flatten(),
+      });
+      return;
+    }
+
+    const updates = validation.data;
+
+    const member = await User.findOne({
+      _id: id,
+      role: "MEMBER",
+    });
+
+    if (!member) {
+      res.status(404).json({
+        success: false,
+        message: "Member not found.",
+      });
+      return;
+    }
+
+    if (updates.email !== undefined) {
+      const duplicateEmail = await User.findOne({
+        email: updates.email,
+        _id: { $ne: id },
+      });
+
+      if (duplicateEmail) {
+        res.status(409).json({
+          success: false,
+          message: "That email is already in use.",
+        });
+        return;
+      }
+    }
+
+    if (updates.name !== undefined) {
+      member.name = updates.name;
+    }
+
+    if (updates.email !== undefined) {
+      member.email = updates.email;
+    }
+
+    if (updates.phone !== undefined) {
+      member.set("phone", updates.phone);
+    }
+
+    if (updates.isActive !== undefined) {
+      member.isActive = updates.isActive;
+    }
+
+    await member.save();
+
+    const safeMember = await User.findById(member._id)
+      .select("-passwordHash");
+
+    res.status(200).json({
+      success: true,
+      message: "Member updated successfully.",
+      data: safeMember,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// DELETE /api/users/:id
+// Soft-deactivate a member to preserve related history.
+export const deactivateMember = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid member ID.",
+      });
+      return;
+    }
+
+    const member = await User.findOne({
+      _id: id,
+      role: "MEMBER",
+    });
+
+    if (!member) {
+      res.status(404).json({
+        success: false,
+        message: "Member not found.",
+      });
+      return;
+    }
+
+    if (!member.isActive) {
+      res.status(409).json({
+        success: false,
+        message: "Member is already deactivated.",
+      });
+      return;
+    }
+
+    member.isActive = false;
+    await member.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Member deactivated successfully.",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+================ FILE: src\controllers\workoutAssignmentController.ts ================
+
+
+import { Request, Response, NextFunction } from "express";
+import mongoose from "mongoose";
+
+import WorkoutAssignment from "../models/WorkoutAssignment";
+import WorkoutPlan from "../models/WorkoutPlan";
+import User from "../models/User";
+
+// POST /api/workout-assignments
+// Admin assigns an active workout plan to an active member.
+export const createWorkoutAssignment = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can assign workouts",
+      });
+      return;
+    }
+
+    const {
+      memberId,
+      workoutPlanId,
+      startDate,
+      endDate,
+      notes,
+    } = req.body ?? {};
+
+    if (
+      typeof memberId !== "string" ||
+      typeof workoutPlanId !== "string" ||
+      !mongoose.isValidObjectId(memberId) ||
+      !mongoose.isValidObjectId(workoutPlanId)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Valid memberId and workoutPlanId are required",
+      });
+      return;
+    }
+
+
+
+    console.log("DEBUG startDate:", startDate);
+    console.log("DEBUG type:", typeof startDate);
+    console.log("DEBUG parsed date:", new Date(startDate).toString());
+
+
+
+    if (
+      startDate !== undefined &&
+      !(
+        (typeof startDate === "string" ||
+          startDate instanceof Date) &&
+        !Number.isNaN(new Date(startDate).getTime())
+      )
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid start date",
+      });
+      return;
+    }
+
+    if (
+      endDate !== undefined &&
+      endDate !== null &&
+      !(
+        (typeof endDate === "string" ||
+          endDate instanceof Date) &&
+        !Number.isNaN(new Date(endDate).getTime())
+      )
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid end date",
+      });
+      return;
+    }
+
+    if (
+      notes !== undefined &&
+      (typeof notes !== "string" || notes.length > 1000)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Notes must be text of at most 1000 characters",
+      });
+      return;
+    }
+
+    const assignmentStartDate = startDate
+      ? new Date(startDate)
+      : new Date();
+
+    const assignmentEndDate =
+      endDate == null ? undefined : new Date(endDate);
+
+    if (
+      assignmentEndDate &&
+      assignmentEndDate < assignmentStartDate
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "End date must be on or after the start date",
+      });
+      return;
+    }
+
+    const member = await User.findOne({
+      _id: memberId,
+      role: "MEMBER",
+      isActive: true,
+    });
+
+    if (!member) {
+      res.status(404).json({
+        success: false,
+        message: "Active member not found",
+      });
+      return;
+    }
+
+    const plan = await WorkoutPlan.findOne({
+      _id: workoutPlanId,
+      isActive: true,
+    });
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Active workout plan not found",
+      });
+      return;
+    }
+
+    const assignment = await WorkoutAssignment.create({
+      memberId: member._id,
+      workoutPlanId: plan._id,
+      assignedBy: new mongoose.Types.ObjectId(currentUser.userId),
+      startDate: assignmentStartDate,
+      ...(assignmentEndDate
+        ? { endDate: assignmentEndDate }
+        : {}),
+      ...(notes !== undefined ? { notes: notes.trim() } : {}),
+      status: "ACTIVE",
+    });
+
+    await assignment.populate([
+      { path: "memberId", select: "name email" },
+      { path: "workoutPlanId" },
+      { path: "assignedBy", select: "name email" },
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: "Workout assigned successfully",
+      data: assignment,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/workout-assignments
+// Admin sees all assignments; members see only their own.
+export const getWorkoutAssignments = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const filter =
+      currentUser.role === "ADMIN"
+        ? {}
+        : { memberId: currentUser.userId };
+
+    const assignments = await WorkoutAssignment.find(filter)
+      .populate("memberId", "name email")
+      .populate("workoutPlanId")
+      .populate("assignedBy", "name email")
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: assignments.length,
+      data: assignments,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/workout-assignments/:id
+// Admin sees any assignment; members see only their own.
+export const getWorkoutAssignmentById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid assignment ID",
+      });
+      return;
+    }
+
+    const assignment = await WorkoutAssignment.findById(id);
+
+    if (!assignment) {
+      res.status(404).json({
+        success: false,
+        message: "Assignment not found",
+      });
+      return;
+    }
+
+    const isOwner =
+      assignment.memberId.toString() === currentUser.userId;
+
+    if (currentUser.role !== "ADMIN" && !isOwner) {
+      res.status(403).json({
+        success: false,
+        message: "You cannot access another member's assignment",
+      });
+      return;
+    }
+
+    await assignment.populate([
+      { path: "memberId", select: "name email" },
+      { path: "workoutPlanId" },
+      { path: "assignedBy", select: "name email" },
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: assignment,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PATCH /api/workout-assignments/:id
+// Only admins can modify assignment details and status.
+export const updateWorkoutAssignment = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can update workout assignments",
+      });
+      return;
+    }
+
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid assignment ID",
+      });
+      return;
+    }
+
+    const updates: unknown = req.body;
+
+    if (
+      !updates ||
+      typeof updates !== "object" ||
+      Array.isArray(updates)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Request body must be an object",
+      });
+      return;
+    }
+
+    const data = updates as Record<string, unknown>;
+    const fields = Object.keys(data);
+    const allowedFields = ["status", "endDate", "notes"];
+
+    if (
+      fields.length === 0 ||
+      fields.some((field) => !allowedFields.includes(field))
+    ) {
+      res.status(400).json({
+        success: false,
+        message:
+          "Only status, endDate, and notes can be updated",
+      });
+      return;
+    }
+
+    if (
+      data.status !== undefined &&
+      !["ACTIVE", "COMPLETED", "CANCELLED"].includes(
+        String(data.status)
+      )
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid assignment status",
+      });
+      return;
+    }
+
+    if (
+      data.notes !== undefined &&
+      (typeof data.notes !== "string" || data.notes.length > 1000)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "Notes must be text of at most 1000 characters",
+      });
+      return;
+    }
+
+    let parsedEndDate: Date | null | undefined;
+
+    if (data.endDate === null) {
+      parsedEndDate = null;
+    } else if (data.endDate !== undefined) {
+      if (typeof data.endDate !== "string") {
+        res.status(400).json({
+          success: false,
+          message: "End date must be a valid date or null",
+        });
+        return;
+      }
+
+      parsedEndDate = new Date(data.endDate);
+
+      if (Number.isNaN(parsedEndDate.getTime())) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid end date",
+        });
+        return;
+      }
+    }
+
+    const assignment = await WorkoutAssignment.findById(id);
+
+    if (!assignment) {
+      res.status(404).json({
+        success: false,
+        message: "Assignment not found",
+      });
+      return;
+    }
+
+    const effectiveEndDate =
+      parsedEndDate === undefined
+        ? assignment.endDate
+        : parsedEndDate;
+
+    if (
+      effectiveEndDate &&
+      effectiveEndDate < assignment.startDate
+    ) {
+      res.status(400).json({
+        success: false,
+        message: "End date must be on or after the start date",
+      });
+      return;
+    }
+
+    if (data.status !== undefined) {
+      assignment.status = data.status as typeof assignment.status;
+    }
+
+    if (parsedEndDate !== undefined) {
+      assignment.endDate = parsedEndDate as typeof assignment.endDate;
+    }
+
+    if (data.notes !== undefined) {
+      assignment.notes = (data.notes as string).trim();
+    }
+
+    await assignment.save();
+
+    await assignment.populate([
+      { path: "memberId", select: "name email" },
+      { path: "workoutPlanId" },
+      { path: "assignedBy", select: "name email" },
+    ]);
+
+    res.status(200).json({
+      success: true,
+      message: "Assignment updated successfully",
+      data: assignment,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+================ FILE: src\controllers\workoutImageController.ts ================
+
+
+import { Request, Response } from "express";
+import mongoose from "mongoose";
+
+import cloudinary from "../config/cloudinary";
+import WorkoutPlan from "../models/WorkoutPlan";
+
+function uploadToCloudinary(
+  fileBuffer: Buffer
+): Promise<{ secure_url: string; public_id: string }> {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "fittrack/workout-images",
+        resource_type: "image",
+      },
+      (error, result) => {
+        if (error || !result) {
+          reject(error ?? new Error("Cloudinary upload failed"));
+          return;
+        }
+
+        resolve({
+          secure_url: result.secure_url,
+          public_id: result.public_id,
+        });
+      }
+    );
+
+    stream.end(fileBuffer);
+  });
+}
+
+export async function uploadWorkoutPlanImage(
+  req: Request,
+  res: Response
+): Promise<void> {
+  let newPublicId: string | undefined;
+  let databaseSaveSucceeded = false;
+
+  try {
+    const { id } = req.params;
+
+    // Validate the workout plan ID.
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid workout plan ID.",
+      });
+      return;
+    }
+
+    // Ensure an image was uploaded.
+    if (!req.file) {
+      res.status(400).json({
+        success: false,
+        message: "Please select a workout image.",
+      });
+      return;
+    }
+
+    // Find the workout plan.
+    const workoutPlan = await WorkoutPlan.findById(id);
+
+    if (!workoutPlan) {
+      res.status(404).json({
+        success: false,
+        message: "Workout plan not found.",
+      });
+      return;
+    }
+
+    // Upload the new image to Cloudinary.
+    const uploadedImage = await uploadToCloudinary(req.file.buffer);
+    newPublicId = uploadedImage.public_id;
+
+    // Keep the old image details until the database save succeeds.
+    const oldPublicId = workoutPlan.imagePublicId;
+
+    workoutPlan.imageUrl = uploadedImage.secure_url;
+    workoutPlan.imagePublicId = uploadedImage.public_id;
+
+    await workoutPlan.save();
+    databaseSaveSucceeded = true;
+
+    // Delete the previous image only after the new image is saved.
+    if (oldPublicId && oldPublicId !== newPublicId) {
+      try {
+        await cloudinary.uploader.destroy(oldPublicId);
+      } catch (deleteError) {
+        console.error(
+          "Could not delete previous workout image:",
+          deleteError
+        );
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Workout image uploaded successfully.",
+      data: {
+        workoutPlanId: workoutPlan._id,
+        imageUrl: workoutPlan.imageUrl,
+      },
+    });
+  } catch (error) {
+    console.error("Workout image upload error:", error);
+
+    // Clean up the new image only if the database save did not succeed.
+    // If the save outcome is uncertain due to a network error, avoid
+    // deleting an image that the database might already reference.
+    if (newPublicId && !databaseSaveSucceeded) {
+      try {
+        await cloudinary.uploader.destroy(newPublicId);
+      } catch (cleanupError) {
+        console.error(
+          "Could not clean up uploaded workout image:",
+          cleanupError
+        );
+      }
+    }
+
+    res.status(500).json({
+      success: false,
+      message: "Unable to upload workout image.",
+    });
+  }
+}
+
+
+================ FILE: src\controllers\workoutPlanController.ts ================
+
+
+import { Request, Response, NextFunction } from "express";
+import mongoose from "mongoose";
+
+import WorkoutPlan from "../models/WorkoutPlan";
+
+import {
+  createWorkoutPlanSchema,
+  updateWorkoutPlanSchema,
+} from "../validators/workoutPlanValidator";
+
+// GET /api/workout-plans
+// Admins can view all plans; members can view active plans only.
+export const getWorkoutPlans = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const filter =
+      req.user.role === "ADMIN" ? {} : { isActive: true };
+
+    const plans = await WorkoutPlan.find(filter)
+      .populate("createdBy", "name email")
+      .sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: plans.length,
+      data: plans,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// GET /api/workout-plans/:id
+// Admins can view any plan; members can view active plans only.
+export const getWorkoutPlanById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid workout plan ID",
+      });
+      return;
+    }
+
+    const plan = await WorkoutPlan.findById(id).populate(
+      "createdBy",
+      "name email"
+    );
+
+    if (!plan || (!plan.isActive && req.user.role !== "ADMIN")) {
+      res.status(404).json({
+        success: false,
+        message: "Workout plan not found",
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/workout-plans
+// Admin creates a workout plan.
+export const createWorkoutPlan = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can create workout plans",
+      });
+      return;
+    }
+
+    const validation = createWorkoutPlanSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid workout plan data",
+        errors: validation.error.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
+      });
+      return;
+    }
+
+    // Server controls the creator and initial active status.
+    const plan = await WorkoutPlan.create({
+      ...validation.data,
+      createdBy: new mongoose.Types.ObjectId(currentUser.userId),
+      isActive: true,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Workout plan created successfully",
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// PATCH /api/workout-plans/:id
+// Admin updates a workout plan.
+export const updateWorkoutPlan = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can update workout plans",
+      });
+      return;
+    }
+
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid workout plan ID",
+      });
+      return;
+    }
+
+    const validation = updateWorkoutPlanSchema.safeParse(req.body);
+
+    if (!validation.success) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid workout plan update",
+        errors: validation.error.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
+      });
+      return;
+    }
+
+    if (Object.keys(validation.data).length === 0) {
+      res.status(400).json({
+        success: false,
+        message: "Provide at least one field to update",
+      });
+      return;
+    }
+
+    const plan = await WorkoutPlan.findById(id);
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Workout plan not found",
+      });
+      return;
+    }
+
+    // Apply validated fields but preserve protected fields.
+    plan.set({
+      ...validation.data,
+      createdBy: plan.createdBy,
+      isActive: plan.isActive,
+    });
+
+    await plan.save();
+
+    await plan.populate("createdBy", "name email");
+
+    res.status(200).json({
+      success: true,
+      message: "Workout plan updated successfully",
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// DELETE /api/workout-plans/:id
+// Admin deactivates a plan without deleting its history.
+export const deactivateWorkoutPlan = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const currentUser = req.user;
+
+    if (!currentUser) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    if (currentUser.role !== "ADMIN") {
+      res.status(403).json({
+        success: false,
+        message: "Only admins can deactivate workout plans",
+      });
+      return;
+    }
+
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid workout plan ID",
+      });
+      return;
+    }
+
+    const plan = await WorkoutPlan.findById(id);
+
+    if (!plan) {
+      res.status(404).json({
+        success: false,
+        message: "Workout plan not found",
+      });
+      return;
+    }
+
+    if (!plan.isActive) {
+      res.status(409).json({
+        success: false,
+        message: "Workout plan is already inactive",
+      });
+      return;
+    }
+
+    plan.isActive = false;
+    await plan.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Workout plan deactivated successfully",
+      data: plan,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+================ FILE: src\middleware\authMiddleware.ts ================
+
+
+import type { Request, Response, NextFunction } from "express";
+
+import { verifyToken } from "../utils/jwt";
+import User from "../models/User";
+
+export const authenticate = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  const token = req.cookies?.fittrack_token;
+
+  // 1. Require the authentication cookie.
+  if (!token || typeof token !== "string") {
+    res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    });
+    return;
+  }
+
+  // 2. Verify the JWT.
+  let payload: ReturnType<typeof verifyToken>;
+
+  try {
+    payload = verifyToken(token);
+  } catch {
+    res.status(401).json({
+      success: false,
+      message: "Invalid or expired authentication token.",
+    });
+    return;
+  }
+
+  // 3. Confirm the user still exists and is active.
+  try {
+    const user = await User.findById(payload.userId)
+      .select("_id role isActive");
+
+    if (!user || !user.isActive) {
+      res.status(401).json({
+        success: false,
+        message: "Account not found or inactive.",
+      });
+      return;
+    }
+
+    // 4. Attach trusted user details to the request.
+    req.user = {
+      userId: user._id.toString(),
+      role: user.role,
+    };
+
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+================ FILE: src\middleware\errorMiddleware.ts ================
+
+
+import type { Request, Response, NextFunction } from "express";
+
+export const errorMiddleware = (
+  error: unknown,
+  _req: Request,
+  res: Response,
+  _next: NextFunction
+): void => {
+  // Do not attempt to send a second response.
+  if (res.headersSent) {
+    return;
+  }
+
+  // Handle MongoDB duplicate-key errors.
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === 11000
+  ) {
+    res.status(409).json({
+      success: false,
+      message: "A record with this value already exists.",
+    });
+    return;
+  }
+
+  // Log the full error on the server, not in the client response.
+  console.error("Unhandled application error:", error);
+
+  res.status(500).json({
+    success: false,
+    message: "Internal server error.",
+  });
+};
+
+
+================ FILE: src\middleware\roleMiddleware.ts ================
+
+
+import type { Request, Response, NextFunction } from "express";
+import type { UserRole } from "../models/User";
+
+export const allowRoles =
+  (...allowedRoles: UserRole[]) =>
+  (req: Request, res: Response, next: NextFunction): void => {
+    // Check whether the user is authenticated.
+    if (!req.user) {
+      res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+      return;
+    }
+
+    // Check whether the user's role is permitted.
+    if (!allowedRoles.includes(req.user.role)) {
+      res.status(403).json({
+        success: false,
+        message: "You do not have permission to perform this action",
+      });
+      return;
+    }
+
+    // Allow the request to continue.
+    next();
+  };
+
+================ FILE: src\middleware\uploadMiddleware.ts ================
+
+
+import multer from "multer";
+import type { Request, Response, NextFunction } from "express";
+
+const allowedMimeTypes = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+];
+
+const storage = multer.memoryStorage();
+
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // Maximum 5 MB
+    files: 1, // One image per request
+  },
+  fileFilter: (
+    _req: Request,
+    file: Express.Multer.File,
+    callback: multer.FileFilterCallback
+  ) => {
+    if (!allowedMimeTypes.includes(file.mimetype)) {
+      callback(
+        new Error("Only JPEG, PNG, and WebP images are allowed.")
+      );
+      return;
+    }
+
+    callback(null, true);
+  },
+});
+
+// Profile picture upload
+export const uploadProfileImage = upload.single("profileImage");
+
+// Workout image upload
+export const uploadWorkoutImage = upload.single("workoutImage");
+
+// Handle errors produced by the upload middleware.
+// Mount this after the routes that use the upload middleware.
+export function handleUploadError(
+  error: unknown,
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      res.status(400).json({
+        success: false,
+        message: "Image size must not exceed 5 MB.",
+      });
+      return;
+    }
+
+    if (error.code === "LIMIT_FILE_COUNT") {
+      res.status(400).json({
+        success: false,
+        message: "Only one image can be uploaded per request.",
+      });
+      return;
+    }
+
+    res.status(400).json({
+      success: false,
+      message: "Image upload failed. Please check the uploaded file.",
+    });
+    return;
+  }
+
+  if (
+    error instanceof Error &&
+    error.message ===
+      "Only JPEG, PNG, and WebP images are allowed."
+  ) {
+    res.status(400).json({
+      success: false,
+      message: error.message,
+    });
+    return;
+  }
+
+  next(error);
+}
+
+
+================ FILE: src\middleware\validateMiddleware.ts ================
+
+
+================ FILE: src\models\Membership.ts ================
+
+
+import mongoose, { Schema, Document, Model, Types } from "mongoose";
+
+export type MembershipStatus =
+  | "UPCOMING"
+  | "ACTIVE"
+  | "EXPIRED"
+  | "CANCELLED";
+
+export interface IMembership extends Document {
+  memberId: Types.ObjectId;
+  planId: Types.ObjectId;
+  startDate: Date;
+  expiryDate: Date;
+  priceCharged: number;
+  status: MembershipStatus;
+  assignedBy: Types.ObjectId;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const membershipSchema = new Schema<IMembership>(
+  {
+    memberId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+
+    planId: {
+      type: Schema.Types.ObjectId,
+      ref: "MembershipPlan",
+      required: true,
+    },
+
+    startDate: {
+      type: Date,
+      required: true,
+    },
+
+    expiryDate: {
+      type: Date,
+      required: true,
+    },
+
+    priceCharged: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    status: {
+      type: String,
+      enum: ["UPCOMING", "ACTIVE", "EXPIRED", "CANCELLED"],
+      required: true,
+      default: "UPCOMING",
+      index: true,
+    },
+
+    assignedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+// Useful for finding a member's memberships
+membershipSchema.index({ memberId: 1, status: 1 });
+
+// Useful for finding memberships nearing expiry
+membershipSchema.index({ status: 1, expiryDate: 1 });
+
+const Membership: Model<IMembership> =
+  mongoose.models.Membership ||
+  mongoose.model<IMembership>("Membership", membershipSchema);
+
+export default Membership;
+
+
+================ FILE: src\models\MembershipPlan.ts ================
+
+
+import mongoose, { Schema, Document, Model } from "mongoose";
+
+export interface IMembershipPlan extends Document {
+  name: string;
+  description: string;
+  durationDays: number;
+  price: number;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const membershipPlanSchema = new Schema<IMembershipPlan>(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+      minlength: 2,
+      maxlength: 100,
+    },
+    description: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 1000,
+    },
+    durationDays: {
+      type: Number,
+      required: true,
+      min: 1,
+      max: 3650,
+    },
+    price: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+membershipPlanSchema.index({ isActive: 1, name: 1 });
+
+const MembershipPlan: Model<IMembershipPlan> =
+  mongoose.models.MembershipPlan ||
+  mongoose.model<IMembershipPlan>(
+    "MembershipPlan",
+    membershipPlanSchema
+  );
+
+export default MembershipPlan;
+
+
+================ FILE: src\models\Payment.ts ================
+
+
+import mongoose, { Schema, Document, Model, Types } from "mongoose";
+
+export type PaymentMethod =
+  | "CASH"
+  | "UPI"
+  | "CARD"
+  | "BANK_TRANSFER"
+  | "OTHER";
+
+export interface IPayment extends Document {
+  memberId: Types.ObjectId;
+  membershipId: Types.ObjectId;
+  amount: number;
+  paymentDate: Date;
+  paymentMethod: PaymentMethod;
+  reference?: string;
+  notes?: string;
+  recordedBy: Types.ObjectId;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const paymentSchema = new Schema<IPayment>(
+  {
+    memberId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+
+    membershipId: {
+      type: Schema.Types.ObjectId,
+      ref: "Membership",
+      required: true,
+      index: true,
+    },
+
+    amount: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    paymentDate: {
+      type: Date,
+      required: true,
+      default: Date.now,
+    },
+
+    paymentMethod: {
+      type: String,
+      enum: ["CASH", "UPI", "CARD", "BANK_TRANSFER", "OTHER"],
+      required: true,
+    },
+
+    reference: {
+      type: String,
+      trim: true,
+      maxlength: 100,
+    },
+
+    notes: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+    },
+
+    recordedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+  },
+  { timestamps: true }
+);
+
+paymentSchema.index({ memberId: 1, paymentDate: -1 });
+paymentSchema.index({ membershipId: 1, paymentDate: -1 });
+
+const Payment: Model<IPayment> =
+  mongoose.models.Payment ||
+  mongoose.model<IPayment>("Payment", paymentSchema);
+
+export default Payment;
+
+
+================ FILE: src\models\User.ts ================
+
+
+import mongoose, { Schema, Document, Model } from "mongoose";
+
+export type UserRole = "ADMIN" | "MEMBER";
+
+export interface IUser extends Document {
+  name: string;
+  email: string;
+  phone?: string;
+  passwordHash: string;
+  role: UserRole;
+  isActive: boolean;
+  profileImage?: {
+    url: string;
+    publicId: string;
+  };
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const userSchema = new Schema<IUser>(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+      minlength: 2,
+      maxlength: 100,
+    },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+      index: true,
+    },
+    phone: {
+      type: String,
+      trim: true,
+      maxlength: 20,
+    },
+    passwordHash: {
+      type: String,
+      required: true,
+      select: false,
+    },
+    role: {
+      type: String,
+      enum: ["ADMIN", "MEMBER"],
+      required: true,
+      default: "MEMBER",
+    },
+    profileImage: {
+      url: { type: String },
+      publicId: { type: String },
+    },
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+const User =
+  mongoose.models.User || mongoose.model<IUser>("User", userSchema);
+
+export default User;
+
+
+================ FILE: src\models\WorkoutAssignment.ts ================
+
+
+import { Schema, model, Types } from "mongoose";
+
+export type WorkoutAssignmentStatus =
+  | "ACTIVE"
+  | "COMPLETED"
+  | "CANCELLED";
+
+export interface IWorkoutAssignment {
+  memberId: Types.ObjectId;
+  workoutPlanId: Types.ObjectId;
+  assignedBy: Types.ObjectId;
+  startDate: Date;
+  endDate?: Date;
+  status: WorkoutAssignmentStatus;
+  notes?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+const workoutAssignmentSchema = new Schema<IWorkoutAssignment>(
+  {
+    memberId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+
+    workoutPlanId: {
+      type: Schema.Types.ObjectId,
+      ref: "WorkoutPlan",
+      required: true,
+      index: true,
+    },
+
+    assignedBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+
+    startDate: {
+      type: Date,
+      required: true,
+      validate: {
+        validator: (value: Date) =>
+          value instanceof Date && !Number.isNaN(value.getTime()),
+        message: "Start date must be valid.",
+      },
+    },
+
+    endDate: {
+      type: Date,
+      validate: {
+        validator: function (this: any, value?: Date) {
+          if (value === undefined || value === null) {
+            return true;
+          }
+
+          return (
+            value instanceof Date &&
+            !Number.isNaN(value.getTime()) &&
+            value >= this.startDate
+          );
+        },
+        message: "End date must be valid and on or after the start date.",
+      },
+    },
+
+    status: {
+      type: String,
+      enum: ["ACTIVE", "COMPLETED", "CANCELLED"],
+      default: "ACTIVE",
+      required: true,
+    },
+
+    notes: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+workoutAssignmentSchema.index({ memberId: 1, status: 1 });
+workoutAssignmentSchema.index({ workoutPlanId: 1, status: 1 });
+
+export default model<IWorkoutAssignment>(
+  "WorkoutAssignment",
+  workoutAssignmentSchema
+);
+
+
+================ FILE: src\models\WorkoutPlan.ts ================
+
+
+import { Schema, model, Types } from "mongoose";
+
+export type WorkoutDifficulty =
+  | "BEGINNER"
+  | "INTERMEDIATE"
+  | "ADVANCED";
+
+export interface IExercise {
+  name: string;
+  description?: string;
+  sets?: number;
+  repetitions?: number;
+  durationMinutes?: number;
+  restSeconds?: number;
+}
+
+export interface IWorkoutPlan {
+  name: string;
+  description?: string;
+  difficulty: WorkoutDifficulty;
+  exercises: IExercise[];
+  imageUrl?: string;
+  createdBy: Types.ObjectId;
+  isActive: boolean;
+  imagePublicId?: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+}
+
+const exerciseSchema = new Schema<IExercise>(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+      minlength: 1,
+      maxlength: 150,
+    },
+    description: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+    },
+    sets: {
+      type: Number,
+      min: 1,
+      validate: {
+        validator: (value: number) => Number.isInteger(value),
+        message: "Sets must be a whole number",
+      },
+    },
+    repetitions: {
+      type: Number,
+      min: 1,
+      validate: {
+        validator: (value: number) => Number.isInteger(value),
+        message: "Repetitions must be a whole number",
+      },
+    },
+    durationMinutes: {
+      type: Number,
+      min: 1,
+      validate: {
+        validator: (value: number) => Number.isInteger(value),
+        message: "Duration must be a whole number",
+      },
+    },
+    restSeconds: {
+      type: Number,
+      min: 0,
+      validate: {
+        validator: (value: number) => Number.isInteger(value),
+        message: "Rest seconds must be a whole number",
+      },
+    },
+  },
+  { _id: false }
+);
+
+const workoutPlanSchema = new Schema<IWorkoutPlan>(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+      minlength: 1,
+      maxlength: 150,
+    },
+    description: {
+      type: String,
+      trim: true,
+      maxlength: 2000,
+    },
+    difficulty: {
+      type: String,
+      enum: ["BEGINNER", "INTERMEDIATE", "ADVANCED"],
+      required: true,
+    },
+    exercises: {
+      type: [exerciseSchema],
+      required: true,
+      validate: {
+        validator: (exercises: IExercise[]) =>
+          exercises.length > 0,
+        message: "At least one exercise is required",
+      },
+    },
+    imageUrl: {
+      type: String,
+      trim: true,
+    },
+    createdBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    isActive: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+    imagePublicId: {
+      type: String,
+      trim: true,
+    },
+  },
+  {
+    timestamps: true,
+  }
+);
+
+workoutPlanSchema.index({ isActive: 1, difficulty: 1 });
+
+export default model<IWorkoutPlan>(
+  "WorkoutPlan",
+  workoutPlanSchema
+);
+
+
+================ FILE: src\models\WorkoutProgress.ts ================
+
+
+import { Schema, model, Types } from "mongoose";
+
+
+function isNonNegativeInteger(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
+
+export interface ICompletedExercise {
+  exerciseName: string;
+  completedSets?: number;
+  repetitions?: number;
+  weightKg?: number;
+  durationMinutes?: number;
+  notes?: string;
+}
+
+export interface IWorkoutProgress {
+  memberId: Types.ObjectId;
+  assignmentId: Types.ObjectId;
+  workoutPlanId: Types.ObjectId;
+  completedAt: Date;
+  exercises: ICompletedExercise[];
+  overallNotes?: string;
+}
+
+const completedExerciseSchema = new Schema<ICompletedExercise>(
+  {
+    exerciseName: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
+    completedSets: {
+    type: Number,
+    min: 0,
+    validate: {
+        validator: isNonNegativeInteger,
+        message: "Completed sets must be a non-negative whole number",
+    },
+    },
+
+
+    repetitions: {
+    type: Number,
+    min: 0,
+    validate: {
+        validator: isNonNegativeInteger,
+        message: "Repetitions must be a non-negative whole number",
+    },
+    },
+
+    weightKg: {
+      type: Number,
+      min: 0,
+    },
+    durationMinutes: {
+      type: Number,
+      min: 0,
+    },
+    notes: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+    },
+  },
+  { _id: false }
+);
+
+const workoutProgressSchema = new Schema<IWorkoutProgress>(
+  {
+    memberId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    assignmentId: {
+      type: Schema.Types.ObjectId,
+      ref: "WorkoutAssignment",
+      required: true,
+      index: true,
+    },
+    workoutPlanId: {
+      type: Schema.Types.ObjectId,
+      ref: "WorkoutPlan",
+      required: true,
+    },
+    completedAt: {
+      type: Date,
+      default: Date.now,
+      required: true,
+    },
+    exercises: {
+      type: [completedExerciseSchema],
+      required: true,
+      validate: {
+        validator: (exercises: ICompletedExercise[]) =>
+          exercises.length > 0,
+        message: "At least one completed exercise is required",
+      },
+    },
+    overallNotes: {
+      type: String,
+      trim: true,
+      maxlength: 2000,
+    },
+  },
+  { timestamps: true }
+);
+
+export default model<IWorkoutProgress>(
+  "WorkoutProgress",
+  workoutProgressSchema
+);
+
+
+================ FILE: src\routes\authRoutes.ts ================
+
+import { Router, Request, Response, NextFunction } from "express";
+
+import {
+  register,
+  login,
+  logout,
+  getMe,
+} from "../controllers/authController";
+
+import { authenticate } from "../middleware/authMiddleware";
+
+import {
+  registerSchema,
+  loginSchema,
+} from "../validators/authValidator";
+
+import { uploadProfileImage } from "../middleware/uploadMiddleware";
+
+const router = Router();
+
+function validateBody(schema: { safeParse: (data: unknown) => any }) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const result = schema.safeParse(req.body);
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed.",
+        errors: result.error.issues,
+      });
+      return;
+    }
+
+    req.body = result.data;
+    next();
+  };
+}
+
+/**
+ * @swagger
+ * tags:
+ *   - name: Authentication
+ *     description: Member registration, login, logout, and current-user information
+ */
+
+/**
+ * @swagger
+ * /api/auth/register:
+ *   post:
+ *     summary: Register a new member
+ *     description: Public registration always creates a MEMBER account. Clients cannot register as ADMIN.
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - email
+ *               - password
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 example: Alex Morgan
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: alex@example.com
+ *               phone:
+ *                 type: string
+ *                 example: "9876543210"
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 example: StrongPassword123
+ *               profileImage:
+ *                 type: string
+ *                 format: binary
+ *                 description: Optional profile image, if supported by the registration validator.
+ *     responses:
+ *       201:
+ *         description: Member registered successfully
+ *       400:
+ *         description: Invalid input or validation failed
+ *       409:
+ *         description: Email already exists
+ */
+router.post(
+  "/register",
+  uploadProfileImage,
+  validateBody(registerSchema),
+  register
+);
+/**
+ * @swagger
+ * /api/auth/login:
+ *   post:
+ *     summary: Log in
+ *     description: Authenticates a user and sets the fittrack_token HTTP-only cookie.
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *               - password
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: alex@example.com
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 example: StrongPassword123
+ *     responses:
+ *       200:
+ *         description: Login successful; authentication cookie set
+ *       400:
+ *         description: Validation failed
+ *       401:
+ *         description: Invalid credentials
+ */
+router.post(
+  "/login",
+  validateBody(loginSchema),
+  login
+);
+
+/**
+ * @swagger
+ * /api/auth/logout:
+ *   post:
+ *     summary: Log out
+ *     description: Logs out the authenticated user and clears the authentication cookie.
+ *     tags: [Authentication]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Logged out successfully
+ *       401:
+ *         description: Authentication required
+ */
+router.post("/logout", authenticate, logout);
+
+/**
+ * @swagger
+ * /api/auth/me:
+ *   get:
+ *     summary: Get the current authenticated user
+ *     tags: [Authentication]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Current user's information, including their role
+ *       401:
+ *         description: Authentication required or session invalid
+ */
+router.get("/me", authenticate, getMe);
+
+export default router;
+
+================ FILE: src\routes\membershipPlanRoutes.ts ================
+
+
+import { Router } from "express";
+
+import {
+  getMembershipPlans,
+  getMembershipPlanById,
+  createMembershipPlan,
+  updateMembershipPlan,
+  deactivateMembershipPlan,
+} from "../controllers/membershipPlanController";
+
+import { authenticate } from "../middleware/authMiddleware";
+import { allowRoles } from "../middleware/roleMiddleware";
+
+const router = Router();
+
+/**
+ * @swagger
+ * tags:
+ *   name: Membership Plans
+ *   description: Manage gym membership plans
+ */
+
+/**
+ * @swagger
+ * /api/membership-plans:
+ *   get:
+ *     summary: Get all active membership plans
+ *     tags: [Membership Plans]
+ *     responses:
+ *       200:
+ *         description: Active membership plans retrieved successfully
+ */
+router.get("/", getMembershipPlans);
+
+/**
+ * @swagger
+ * /api/membership-plans/{id}:
+ *   get:
+ *     summary: Get an active membership plan by ID
+ *     tags: [Membership Plans]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Membership plan retrieved successfully
+ *       400:
+ *         description: Invalid membership plan ID
+ *       404:
+ *         description: Membership plan not found
+ */
+router.get("/:id", getMembershipPlanById);
+
+/**
+ * @swagger
+ * /api/membership-plans:
+ *   post:
+ *     summary: Create a membership plan
+ *     tags: [Membership Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - description
+ *               - durationDays
+ *               - price
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 example: Monthly Plan
+ *               description:
+ *                 type: string
+ *                 example: Access to the gym for one month
+ *               durationDays:
+ *                 type: integer
+ *                 example: 30
+ *               price:
+ *                 type: number
+ *                 example: 1500
+ *     responses:
+ *       201:
+ *         description: Membership plan created successfully
+ *       400:
+ *         description: Validation failed
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ */
+router.post(
+  "/",
+  authenticate,
+  allowRoles("ADMIN"),
+  createMembershipPlan
+);
+
+/**
+ * @swagger
+ * /api/membership-plans/{id}:
+ *   patch:
+ *     summary: Update an active membership plan
+ *     tags: [Membership Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               description:
+ *                 type: string
+ *               durationDays:
+ *                 type: integer
+ *               price:
+ *                 type: number
+ *     responses:
+ *       200:
+ *         description: Membership plan updated successfully
+ *       400:
+ *         description: Invalid ID or validation failed
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Active plan not found
+ */
+router.patch(
+  "/:id",
+  authenticate,
+  allowRoles("ADMIN"),
+  updateMembershipPlan
+);
+
+/**
+ * @swagger
+ * /api/membership-plans/{id}:
+ *   delete:
+ *     summary: Deactivate a membership plan
+ *     tags: [Membership Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Membership plan deactivated successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Active plan not found
+ */
+router.delete(
+  "/:id",
+  authenticate,
+  allowRoles("ADMIN"),
+  deactivateMembershipPlan
+);
+
+export default router;
+
+
+================ FILE: src\routes\membershipRoutes.ts ================
+
+import { Router } from "express";
+
+import {
+  createMembership,
+  getMyMemberships,
+  getAllMemberships,
+  getExpiringMemberships,
+  getMembershipById,
+  cancelMembership,
+  renewMembership,
+} from "../controllers/membershipController";
+
+import { authenticate } from "../middleware/authMiddleware";
+import { allowRoles } from "../middleware/roleMiddleware";
+
+const router = Router();
+
+// Every route requires a valid, active user's authentication.
+router.use(authenticate);
+
+/**
+ * @swagger
+ * tags:
+ *   - name: Memberships
+ *     description: Member subscriptions, expiry, renewal, and cancellation
+ */
+
+/**
+ * @swagger
+ * /api/memberships:
+ *   post:
+ *     summary: Assign a membership to a member
+ *     description: Admin only. Assigns a membership using an existing membership plan.
+ *     tags: [Memberships]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - memberId
+ *               - planId
+ *               - startDate
+ *             properties:
+ *               memberId:
+ *                 type: string
+ *                 example: 671234567890123456789012
+ *               planId:
+ *                 type: string
+ *                 example: 671234567890123456789013
+ *               startDate:
+ *                 type: string
+ *                 format: date
+ *                 example: "2026-10-15"
+ *     responses:
+ *       201:
+ *         description: Membership assigned successfully
+ *       400:
+ *         description: Invalid request or membership data
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin role required
+ *       404:
+ *         description: Member or membership plan not found
+ */
+router.post("/", allowRoles("ADMIN"), createMembership);
+
+
+
+// GET /api/memberships: admin views all memberships
+router.get("/", allowRoles("ADMIN"), getAllMemberships);
+
+/**
+ * @swagger
+ * /api/memberships/me:
+ *   get:
+ *     summary: Get my memberships
+ *     description: Member only. Returns memberships belonging to the authenticated member.
+ *     tags: [Memberships]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Own memberships retrieved successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Member role required
+ */
+router.get("/me", allowRoles("MEMBER"), getMyMemberships);
+
+/**
+ * @swagger
+ * /api/memberships/expiring:
+ *   get:
+ *     summary: Get expiring memberships
+ *     description: Admin only. Returns memberships expiring within the controller's configured period.
+ *     tags: [Memberships]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Expiring memberships retrieved successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin role required
+ */
+router.get(
+  "/expiring",
+  allowRoles("ADMIN"),
+  getExpiringMemberships
+);
+
+
+
+/**
+ * @swagger
+ * /api/memberships/{id}:
+ *   get:
+ *     summary: Get a membership by ID
+ *     description: Admins may view memberships; members may view only memberships they own, as enforced by the controller.
+ *     tags: [Memberships]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: MongoDB membership ID
+ *     responses:
+ *       200:
+ *         description: Membership retrieved successfully
+ *       400:
+ *         description: Invalid membership ID
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Not permitted to view this membership
+ *       404:
+ *         description: Membership not found
+ */
+router.get("/:id", getMembershipById);
+
+/**
+ * @swagger
+ * /api/memberships/{id}/cancel:
+ *   patch:
+ *     summary: Cancel a membership
+ *     description: Admin only.
+ *     tags: [Memberships]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: MongoDB membership ID
+ *     responses:
+ *       200:
+ *         description: Membership cancelled successfully
+ *       400:
+ *         description: Invalid ID or membership cannot be cancelled
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin role required
+ *       404:
+ *         description: Membership not found
+ */
+router.patch(
+  "/:id/cancel",
+  allowRoles("ADMIN"),
+  cancelMembership
+);
+
+/**
+ * @swagger
+ * /api/memberships/{id}/renew:
+ *   post:
+ *     summary: Renew a membership
+ *     description: Admin only. Renews an existing membership according to the controller's renewal rules.
+ *     tags: [Memberships]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: MongoDB membership ID
+ *     responses:
+ *       200:
+ *         description: Membership renewed successfully
+ *       400:
+ *         description: Invalid ID or membership cannot be renewed
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin role required
+ *       404:
+ *         description: Membership not found
+ */
+router.post(
+  "/:id/renew",
+  allowRoles("ADMIN"),
+  renewMembership
+);
+
+export default router;
+
+================ FILE: src\routes\paymentRoutes.ts ================
+
+
+import { Router } from "express";
+import {
+  createPayment,
+  getAllPayments,
+  getMyPayments,
+  getPaymentById,
+} from "../controllers/paymentController";
+import { authenticate } from "../middleware/authMiddleware";
+import { allowRoles } from "../middleware/roleMiddleware";
+
+const router = Router();
+
+router.use(authenticate);
+
+// Admin records payments.
+
+/**
+ * @swagger
+ * /api/payments:
+ *   post:
+ *     summary: Record a manual payment for a membership
+ *     tags: [Payments]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [membershipId, amount, paymentMethod]
+ *             properties:
+ *               membershipId:
+ *                 type: string
+ *               amount:
+ *                 type: number
+ *                 exclusiveMinimum: 0
+ *               paymentDate:
+ *                 type: string
+ *                 format: date-time
+ *               paymentMethod:
+ *                 type: string
+ *                 enum: [CASH, UPI, CARD, BANK_TRANSFER, OTHER]
+ *               reference:
+ *                 type: string
+ *               notes:
+ *                 type: string
+ *     responses:
+ *       '201':
+ *         description: Payment recorded successfully
+ *       '400':
+ *         description: Invalid payment data
+ *       '401':
+ *         description: Authentication required
+ *       '403':
+ *         description: Admin access required
+ *       '404':
+ *         description: Membership not found
+ *       '409':
+ *         description: Payment exceeds remaining balance or membership is cancelled
+ */
+router.post("/", allowRoles("ADMIN"), createPayment);
+
+// Members view their own payment history.
+
+/**
+ * @swagger
+ * /api/payments/me:
+ *   get:
+ *     summary: Get the logged-in member's payment history
+ *     tags: [Payments]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       '200':
+ *         description: Payment history retrieved successfully
+ *       '401':
+ *         description: Authentication required
+ *       '403':
+ *         description: Member access required
+ */
+router.get("/me", allowRoles("MEMBER"), getMyPayments);
+
+// Admin views all payment records.
+
+/**
+ * @swagger
+ * /api/payments:
+ *   get:
+ *     summary: Get all payment records
+ *     tags: [Payments]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       '200':
+ *         description: Payments retrieved successfully
+ *       '401':
+ *         description: Authentication required
+ *       '403':
+ *         description: Admin access required
+ */
+router.get("/", allowRoles("ADMIN"), getAllPayments);
+
+// Admin views any payment; members can view only their own.
+
+/**
+ * @swagger
+ * /api/payments/{id}:
+ *   get:
+ *     summary: Get a payment by ID
+ *     description: Admins can view any payment; members can view only their own.
+ *     tags: [Payments]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       '200':
+ *         description: Payment retrieved successfully
+ *       '400':
+ *         description: Invalid payment ID
+ *       '401':
+ *         description: Authentication required
+ *       '403':
+ *         description: Access denied
+ *       '404':
+ *         description: Payment not found
+ */
+router.get("/:id", getPaymentById);
+
+export default router;
+
+
+================ FILE: src\routes\userRoutes.ts ================
+
+
+import { Router } from "express";
+
+import { updateProfileImage } from "../controllers/authController";
+import {
+  getMembers,
+  getMemberById,
+  createMember,
+  updateMember,
+  deactivateMember,
+} from "../controllers/userController";
+
+import { authenticate } from "../middleware/authMiddleware";
+import { allowRoles } from "../middleware/roleMiddleware";
+import { uploadProfileImage } from "../middleware/uploadMiddleware";
+
+const router = Router();
+
+/**
+ * @swagger
+ * tags:
+ *   - name: Users
+ *     description: Member management and user profile operations
+ */
+
+/**
+ * @swagger
+ * /api/users:
+ *   get:
+ *     summary: List members
+ *     description: Admin only. Lists members, optionally filtered by search criteria supported by the controller.
+ *     tags: [Users]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Members retrieved successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ *   post:
+ *     summary: Create a member
+ *     description: Admin only. Creates a member account.
+ *     tags: [Users]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - email
+ *               - password
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 example: Alex Johnson
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 example: alex@example.com
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 example: StrongPassword123
+ *               phone:
+ *                 type: string
+ *                 example: "9876543210"
+ *     responses:
+ *       201:
+ *         description: Member created successfully
+ *       400:
+ *         description: Invalid input or member already exists
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ */
+
+/**
+ * @swagger
+ * /api/users/{id}:
+ *   get:
+ *     summary: Get a member by ID
+ *     tags: [Users]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Member retrieved successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Member not found
+ *   patch:
+ *     summary: Update a member
+ *     description: Admin only. Updates member details or account status.
+ *     tags: [Users]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               phone:
+ *                 type: string
+ *               isActive:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Member updated successfully
+ *       400:
+ *         description: Invalid input
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Member not found
+ *   delete:
+ *     summary: Deactivate a member
+ *     description: Admin only. Soft-deactivates a member account.
+ *     tags: [Users]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Member deactivated successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Member not found
+ */
+
+/**
+ * @swagger
+ * /api/users/me/profile-image:
+ *   patch:
+ *     summary: Update my profile picture
+ *     description: Uploads a profile picture for the authenticated user.
+ *     tags: [Users]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - image
+ *             properties:
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Profile picture updated successfully
+ *       400:
+ *         description: Invalid or missing image
+ *       401:
+ *         description: Authentication required
+ */
+
+router.use(authenticate);
+
+// Admin: list members.
+router.get("/", allowRoles("ADMIN"), getMembers);
+
+// Admin: create a member.
+router.post("/", allowRoles("ADMIN"), createMember);
+
+// Admin: get a member by ID.
+router.get("/:id", allowRoles("ADMIN"), getMemberById);
+
+// Admin: update a member.
+router.patch("/:id", allowRoles("ADMIN"), updateMember);
+
+// Admin: deactivate a member.
+router.delete("/:id", allowRoles("ADMIN"), deactivateMember);
+
+// Authenticated user: update their own profile picture.
+router.patch("/me/profile-image", uploadProfileImage, updateProfileImage);
+
+export default router;
+
+
+================ FILE: src\routes\workoutAssignmentRoutes.ts ================
+
+import { Router, Request, Response, NextFunction } from "express";
+import { authenticate } from "../middleware/authMiddleware";
+
+import {
+  createWorkoutAssignment,
+  getWorkoutAssignments,
+  getWorkoutAssignmentById,
+  updateWorkoutAssignment,
+} from "../controllers/workoutAssignmentController";
+
+import {
+  createWorkoutAssignmentSchema,
+  updateWorkoutAssignmentSchema,
+} from "../validators/workoutAssignmentValidator";
+
+const router = Router();
+
+function validateBody(schema: {
+  safeParse: (data: unknown) => any;
+}) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const result = schema.safeParse(req.body);
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: result.error.issues,
+      });
+      return;
+    }
+
+    req.body = result.data;
+    next();
+  };
+}
+
+/**
+ * @swagger
+ * tags:
+ *   - name: Workout Assignments
+ *     description: Assign workout plans to members and manage assignments
+ */
+
+/**
+ * @swagger
+ * /api/workout-assignments:
+ *   post:
+ *     summary: Assign a workout plan to a member
+ *     description: Requires authentication. The controller must restrict assignment creation to admins.
+ *     tags: [Workout Assignments]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             description: Must match createWorkoutAssignmentSchema.
+ *             required:
+ *               - memberId
+ *               - workoutPlanId
+ *             properties:
+ *               memberId:
+ *                 type: string
+ *                 example: "671234567890123456789012"
+ *               workoutPlanId:
+ *                 type: string
+ *                 example: "671234567890123456789013"
+ *               startDate:
+ *                 type: string
+ *                 format: date
+ *                 example: "2026-10-15"
+ *               endDate:
+ *                 type: string
+ *                 format: date
+ *                 example: "2026-11-15"
+ *               notes:
+ *                 type: string
+ *                 example: "Three sessions per week"
+ *     responses:
+ *       201:
+ *         description: Workout plan assigned successfully
+ *       400:
+ *         description: Validation failed
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin role required
+ *       404:
+ *         description: Member or workout plan not found
+ */
+router.post(
+  "/",
+  authenticate,
+  validateBody(createWorkoutAssignmentSchema),
+  createWorkoutAssignment
+);
+
+/**
+ * @swagger
+ * /api/workout-assignments:
+ *   get:
+ *     summary: List workout assignments
+ *     description: Returns assignments according to the authenticated user's role and the controller's access rules.
+ *     tags: [Workout Assignments]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Workout assignments retrieved successfully
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Access denied
+ */
+router.get("/", authenticate, getWorkoutAssignments);
+
+/**
+ * @swagger
+ * /api/workout-assignments/{id}:
+ *   get:
+ *     summary: Get a workout assignment by ID
+ *     description: Access is subject to the controller's authorization and ownership checks.
+ *     tags: [Workout Assignments]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: MongoDB workout assignment ID
+ *     responses:
+ *       200:
+ *         description: Workout assignment retrieved successfully
+ *       400:
+ *         description: Invalid assignment ID
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Access denied
+ *       404:
+ *         description: Workout assignment not found
+ */
+router.get("/:id", authenticate, getWorkoutAssignmentById);
+
+/**
+ * @swagger
+ * /api/workout-assignments/{id}:
+ *   patch:
+ *     summary: Update a workout assignment
+ *     description: Requires authentication. The controller must restrict updates to authorized admins.
+ *     tags: [Workout Assignments]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: MongoDB workout assignment ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             description: Fields accepted by updateWorkoutAssignmentSchema.
+ *             properties:
+ *               startDate:
+ *                 type: string
+ *                 format: date
+ *               endDate:
+ *                 type: string
+ *                 format: date
+ *               status:
+ *                 type: string
+ *                 enum: [ACTIVE, COMPLETED, CANCELLED]
+ *               notes:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Workout assignment updated successfully
+ *       400:
+ *         description: Validation failed or invalid assignment ID
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Access denied
+ *       404:
+ *         description: Workout assignment not found
+ */
+router.patch(
+  "/:id",
+  authenticate,
+  validateBody(updateWorkoutAssignmentSchema),
+  updateWorkoutAssignment
+);
+
+export default router;
+
+================ FILE: src\routes\workoutPlanRoutes.ts ================
+
+
+import { Router } from "express";
+import {
+  createWorkoutPlan,
+  deactivateWorkoutPlan,
+  getWorkoutPlanById,
+  getWorkoutPlans,
+  updateWorkoutPlan,
+} from "../controllers/workoutPlanController";
+import { authenticate } from "../middleware/authMiddleware";
+import { allowRoles } from "../middleware/roleMiddleware";
+import {
+  uploadWorkoutImage,
+} from "../middleware/uploadMiddleware";
+
+import {
+  uploadWorkoutPlanImage,
+} from "../controllers/workoutImageController";
+
+import {
+  createWorkoutPlanSchema,
+  updateWorkoutPlanSchema,
+} from "../validators/workoutPlanValidator";
+import { Request, Response, NextFunction } from "express";
+
+const router = Router();
+function validateBody(schema: {
+  safeParse: (data: unknown) => any;
+}) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const result = schema.safeParse(req.body);
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        message: "Validation failed",
+        errors: result.error.issues,
+      });
+      return;
+    }
+
+    req.body = result.data;
+    next();
+  };
+}
+
+// All workout plan routes require a valid login.
+router.use(authenticate);
+
+/**
+ * @swagger
+ * tags:
+ *   name: Workout Plans
+ *   description: Manage workout plans and exercises
+ */
+
+/**
+ * @swagger
+ * /api/workout-plans:
+ *   get:
+ *     summary: List workout plans
+ *     tags: [Workout Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     responses:
+ *       200:
+ *         description: Workout plans retrieved successfully
+ *       401:
+ *         description: Authentication required
+ */
+router.get("/", getWorkoutPlans);
+
+/**
+ * @swagger
+ * /api/workout-plans/{id}:
+ *   get:
+ *     summary: Get a workout plan by ID
+ *     tags: [Workout Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Workout plan retrieved successfully
+ *       400:
+ *         description: Invalid workout plan ID
+ *       404:
+ *         description: Workout plan not found
+ */
+router.get("/:id", getWorkoutPlanById);
+
+/**
+ * @swagger
+ * /api/workout-plans:
+ *   post:
+ *     summary: Create a workout plan (Admin only)
+ *     tags: [Workout Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - difficulty
+ *               - exercises
+ *             properties:
+ *               name:
+ *                 type: string
+ *                 example: Full Body Strength
+ *               description:
+ *                 type: string
+ *                 example: A full body strength training plan
+ *               difficulty:
+ *                 type: string
+ *                 enum: [BEGINNER, INTERMEDIATE, ADVANCED]
+ *                 example: BEGINNER
+ *               exercises:
+ *                 type: array
+ *                 minItems: 1
+ *                 items:
+ *                   type: object
+ *                   required:
+ *                     - name
+ *                   properties:
+ *                     name:
+ *                       type: string
+ *                       example: Push-ups
+ *                     description:
+ *                       type: string
+ *                       example: Standard bodyweight push-ups
+ *                     sets:
+ *                       type: integer
+ *                       minimum: 1
+ *                       example: 3
+ *                     repetitions:
+ *                       type: integer
+ *                       minimum: 1
+ *                       example: 12
+ *                     durationMinutes:
+ *                       type: integer
+ *                       minimum: 1
+ *                       example: 10
+ *                     restSeconds:
+ *                       type: integer
+ *                       minimum: 0
+ *                       example: 60
+ *     responses:
+ *       201:
+ *         description: Workout plan created successfully
+ *       400:
+ *         description: Invalid input
+ *       401:
+ *         description: Authentication required
+ *       403:
+ *         description: Admin access required
+ */
+router.post(
+  "/",
+  allowRoles("ADMIN"),
+  validateBody(createWorkoutPlanSchema),
+  createWorkoutPlan
+);
+
+/**
+ * @swagger
+ * /api/workout-plans/{id}:
+ *   patch:
+ *     summary: Update a workout plan (Admin only)
+ *     tags: [Workout Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Workout plan updated successfully
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Workout plan not found
+ */
+router.patch(
+  "/:id",
+  allowRoles("ADMIN"),
+  validateBody(updateWorkoutPlanSchema),
+  updateWorkoutPlan
+);
+
+/**
+ * @swagger
+ * /api/workout-plans/{id}:
+ *   delete:
+ *     summary: Deactivate a workout plan (Admin only)
+ *     tags: [Workout Plans]
+ *     security:
+ *       - cookieAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Workout plan deactivated successfully
+ *       403:
+ *         description: Admin access required
+ *       404:
+ *         description: Workout plan not found
+ */
+router.delete("/:id", allowRoles("ADMIN"), deactivateWorkoutPlan);
+
+router.patch(
+  "/:id/image",
+  allowRoles("ADMIN"),
+  uploadWorkoutImage,
+  uploadWorkoutPlanImage
+);
+
+export default router;
+
+
+================ FILE: src\server.ts ================
+
+
+import "dotenv/config";
+import app from "./app";
+import { connectDatabase } from "./config/database";
+
+const PORT = Number(process.env.PORT) || 5000;
+
+const startServer = async (): Promise<void> => {
+  try {
+    await connectDatabase();
+
+    app.listen(PORT, () => {
+      console.log(`FitTrack API running at http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error("Failed to start FitTrack:", error);
+    process.exit(1);
+  }
+};
+
+void startServer();
+
+
+================ FILE: src\types\express.d.ts ================
+
+
+import type { UserRole } from "../models/User";
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        userId: string;
+        role: UserRole;
+      };
+    }
+  }
+}
+
+export {};
+
+
+================ FILE: src\utils\jwt.ts ================
+
+
+import jwt, { type SignOptions } from "jsonwebtoken";
+import mongoose from "mongoose";
+import type { UserRole } from "../models/User";
+
+const getJwtSecret = (): string => {
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret || secret.length < 32) {
+    throw new Error(
+      "JWT_SECRET must be set to a secret of at least 32 characters."
+    );
+  }
+
+  return secret;
+};
+
+export interface TokenPayload {
+  userId: string;
+  role: UserRole;
+}
+
+const isUserRole = (role: unknown): role is UserRole =>
+  role === "ADMIN" || role === "MEMBER";
+
+export const createToken = (payload: TokenPayload): string => {
+  const options: SignOptions = {
+    expiresIn: "1d",
+  };
+
+  return jwt.sign(payload, getJwtSecret(), options);
+};
+
+export const verifyToken = (token: string): TokenPayload => {
+  const decoded = jwt.verify(token, getJwtSecret());
+
+  if (
+    typeof decoded === "string" ||
+    !mongoose.isValidObjectId(decoded.userId) ||
+    !isUserRole(decoded.role)
+  ) {
+    throw new Error("Invalid token payload.");
+  }
+
+  return {
+    userId: decoded.userId,
+    role: decoded.role,
+  };
+};
+
+
+================ FILE: src\validators\authValidator.ts ================
+
+
+import { z } from "zod";
+
+export const registerSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(2, "Name must be at least 2 characters")
+      .max(80, "Name must not exceed 80 characters"),
+
+    phone: z
+      .string()
+      .trim()
+      .regex(/^\+?[0-9]{10,15}$/, "Enter a valid phone number"),
+
+    email: z
+      .string()
+      .trim()
+      .email("Enter a valid email address")
+      .transform((value) => value.toLowerCase()),
+
+    password: z
+      .string()
+      .min(8, "Password must be at least 8 characters")
+      .max(72, "Password must not exceed 72 characters"),
+  })
+  .strict();
+
+export const loginSchema = z
+  .object({
+    email: z
+      .string()
+      .trim()
+      .email("Enter a valid email address")
+      .transform((value) => value.toLowerCase()),
+
+    password: z
+      .string()
+      .min(1, "Password is required")
+      .max(72, "Password must not exceed 72 characters"),
+  })
+  .strict();
+
+export type RegisterInput = z.infer<typeof registerSchema>;
+export type LoginInput = z.infer<typeof loginSchema>;
+
+
+================ FILE: src\validators\membershipPlanValidator.ts ================
+
+
+import { z } from "zod";
+
+export const createMembershipPlanSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, "Plan name must be at least 2 characters")
+    .max(100, "Plan name cannot exceed 100 characters"),
+
+  description: z
+    .string()
+    .trim()
+    .min(1, "Description is required")
+    .max(1000, "Description cannot exceed 1000 characters"),
+
+  durationDays: z.coerce
+    .number()
+    .int("Duration must be a whole number of days")
+    .min(1, "Duration must be at least 1 day")
+    .max(3650, "Duration cannot exceed 3650 days"),
+
+  price: z.coerce
+    .number()
+    .finite("Price must be a finite number")
+    .min(0, "Price cannot be negative"),
+});
+
+export const updateMembershipPlanSchema =
+  createMembershipPlanSchema
+    .partial()
+    .refine(
+      (data) => Object.keys(data).length > 0,
+      "At least one field must be provided"
+    );
+
+
+================ FILE: src\validators\membershipValidator.ts ================
+
+
+import { z } from "zod";
+
+export const createMembershipSchema = z.object({
+  memberId: z
+    .string()
+    .regex(/^[0-9a-fA-F]{24}$/, "Invalid member ID"),
+
+  planId: z
+    .string()
+    .regex(/^[0-9a-fA-F]{24}$/, "Invalid membership plan ID"),
+
+  startDate: z
+    .coerce
+    .date()
+    .refine((date) => !Number.isNaN(date.getTime()), "Invalid start date")
+    .optional(),
+});
+
+export const cancelMembershipSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .max(500, "Reason cannot exceed 500 characters")
+    .optional(),
+});
+
+
+export const renewMembershipSchema = z.object({
+  planId: z
+    .string()
+    .regex(/^[0-9a-fA-F]{24}$/, "Invalid membership plan ID")
+    .optional(),
+});
+
+
+================ FILE: src\validators\paymentValidator.ts ================
+
+
+import { z } from "zod";
+
+const objectIdSchema = z
+  .string()
+  .regex(/^[0-9a-fA-F]{24}$/, "Invalid MongoDB ID");
+
+export const createPaymentSchema = z.object({
+  membershipId: objectIdSchema,
+
+  amount: z.coerce
+    .number()
+    .finite("Amount must be a valid number")
+    .positive("Amount must be greater than zero"),
+
+  paymentDate: z.coerce
+    .date()
+    .optional(),
+
+  paymentMethod: z.enum([
+    "CASH",
+    "UPI",
+    "CARD",
+    "BANK_TRANSFER",
+    "OTHER",
+  ]),
+
+  reference: z
+    .string()
+    .trim()
+    .max(100, "Reference cannot exceed 100 characters")
+    .optional(),
+
+  notes: z
+    .string()
+    .trim()
+    .max(1000, "Notes cannot exceed 1000 characters")
+    .optional(),
+});
+
+export const updatePaymentNotesSchema = z
+  .object({
+    notes: z
+      .string()
+      .trim()
+      .max(1000, "Notes cannot exceed 1000 characters"),
+  });
+
+
+================ FILE: src\validators\userValidator.ts ================
+
+
+import { z } from "zod";
+
+// Rules for creating a member account
+export const createMemberSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, "Name must be at least 2 characters")
+    .max(100, "Name cannot exceed 100 characters"),
+
+  email: z
+    .string()
+    .trim()
+    .email("Please enter a valid email address")
+    .transform((value) => value.toLowerCase()),
+
+  phone: z
+    .string()
+    .trim()
+    .min(7, "Phone number must be at least 7 characters")
+    .max(20, "Phone number cannot exceed 20 characters")
+    .optional(),
+
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters")
+    .max(72, "Password cannot exceed 72 characters"),
+});
+
+// Rules for updating a member's profile
+export const updateMemberSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(2, "Name must be at least 2 characters")
+      .max(100, "Name cannot exceed 100 characters")
+      .optional(),
+
+    email: z
+      .string()
+      .trim()
+      .email("Please enter a valid email address")
+      .transform((value) => value.toLowerCase())
+      .optional(),
+
+    phone: z
+      .string()
+      .trim()
+      .min(7, "Phone number must be at least 7 characters")
+      .max(20, "Phone number cannot exceed 20 characters")
+      .optional(),
+
+    isActive: z.boolean().optional(),
+  })
+  .refine(
+    (data) => Object.keys(data).length > 0,
+    "At least one field must be provided"
+  );
+
+
+================ FILE: src\validators\workoutAssignmentValidator.ts ================
+
+
+import { z } from "zod";
+
+// Validate a new workout assignment
+export const createWorkoutAssignmentSchema = z
+  .object({
+    memberId: z
+      .string()
+      .regex(/^[a-f\d]{24}$/i, "Invalid member ID"),
+
+    workoutPlanId: z
+      .string()
+      .regex(/^[a-f\d]{24}$/i, "Invalid workout plan ID"),
+
+    startDate: z.coerce.date(),
+
+    endDate: z.coerce.date().optional(),
+
+    notes: z.string().trim().max(1000).optional(),
+  })
+  .strict()
+  .refine(
+    (data) => !data.endDate || data.endDate >= data.startDate,
+    {
+      message: "End date must be on or after the start date",
+      path: ["endDate"],
+    }
+  );
+
+// Validate updates to an existing assignment
+export const updateWorkoutAssignmentSchema = z
+  .object({
+    status: z.enum(["ACTIVE", "COMPLETED", "CANCELLED"]).optional(),
+
+    endDate: z.coerce.date().optional(),
+
+    notes: z.string().trim().max(1000).optional(),
+  })
+  .strict()
+  .refine((data) => Object.keys(data).length > 0, {
+    message: "Provide at least one field to update",
+  });
+
+
+================ FILE: src\validators\workoutPlanValidator.ts ================
+
+
+import { z } from "zod";
+
+const exerciseSchema = z
+  .object({
+    name: z.string().trim().min(1).max(150),
+    description: z.string().trim().max(1000).optional(),
+    sets: z.number().int().min(1).optional(),
+    repetitions: z.number().int().min(1).optional(),
+    durationMinutes: z.number().int().min(1).optional(),
+    restSeconds: z.number().int().min(0).optional(),
+  })
+  .strict();
+
+export const createWorkoutPlanSchema = z
+  .object({
+    name: z.string().trim().min(1).max(150),
+    description: z.string().trim().max(2000).optional(),
+    difficulty: z.enum([
+      "BEGINNER",
+      "INTERMEDIATE",
+      "ADVANCED",
+    ]),
+    exercises: z.array(exerciseSchema).min(1),
+  })
+  .strict();
+
+export const updateWorkoutPlanSchema = z
+  .object({
+    name: z.string().trim().min(1).max(150).optional(),
+    description: z.string().trim().max(2000).optional(),
+    difficulty: z
+      .enum(["BEGINNER", "INTERMEDIATE", "ADVANCED"])
+      .optional(),
+    exercises: z.array(exerciseSchema).min(1).optional(),
+  })
+  .strict()
+  .refine((data) => Object.keys(data).length > 0, {
+    message: "Provide at least one field to update",
+  });
+
+
+================ FILE: src\validators\workoutValidator.ts ================
+
+
+import { z } from "zod";
+
+const exerciseSchema = z.object({
+  name: z.string()
+    .trim()
+    .min(2, "Exercise name must be at least 2 characters")
+    .max(100, "Exercise name cannot exceed 100 characters"),
+
+  description: z.string()
+    .trim()
+    .max(500, "Exercise description cannot exceed 500 characters")
+    .optional(),
+
+  sets: z.coerce.number().int().min(1).max(100).optional(),
+  repetitions: z.coerce.number().int().min(1).max(1000).optional(),
+  durationMinutes: z.coerce.number().int().min(1).max(1440).optional(),
+  restSeconds: z.coerce.number().int().min(0).max(3600).optional(),
+});
+
+export const createWorkoutPlanSchema = z.object({
+  name: z.string()
+    .trim()
+    .min(2, "Workout name must be at least 2 characters")
+    .max(100),
+
+  description: z.string()
+    .trim()
+    .min(1, "Description is required")
+    .max(2000),
+
+  difficulty: z.enum(["BEGINNER", "INTERMEDIATE", "ADVANCED"]),
+
+  exercises: z.array(exerciseSchema)
+    .min(1, "Add at least one exercise")
+    .max(100, "A plan cannot contain more than 100 exercises"),
+
+  imageUrl: z.string().url().optional(),
+  imagePublicId: z.string().trim().optional(),
+});
+
+export const updateWorkoutPlanSchema = createWorkoutPlanSchema
+  .partial()
+  .refine(
+    (data) => Object.keys(data).length > 0,
+    "Provide at least one field to update"
+  );
+
+
+================ FILE: tsconfig.json ================
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "scripts"]
+}
